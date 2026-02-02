@@ -1,0 +1,96 @@
+name: RDP-ONLY
+
+on:
+  workflow_dispatch:
+    inputs:
+      ts_tailnet:
+        description: "Tailscale tailnet (example@gmail.com)"
+        required: true
+      ts_api_key:
+        description: "Tailscale API key"
+        required: true
+      ts_authkey:
+        description: "Tailscale Auth key"
+        required: true
+      runtime_minutes:
+        description: "Runtime (max 360)"
+        required: false
+        default: "355"
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 370
+
+    env:
+      RDP_USER: Bullettemporary
+      RDP_PASS: Bullet@12345
+
+    steps:
+      # ===============================
+      # INSTALL & CONNECT TAILSCALE
+      # ===============================
+      - name: Install & Connect Tailscale
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $ts)) {
+            $msi = "$env:TEMP\tailscale.msi"
+            Invoke-WebRequest https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi -OutFile $msi
+            Start-Process msiexec.exe -ArgumentList "/i","`"$msi`"","/quiet","/norestart" -Wait
+          }
+          & $ts up --authkey "${{ inputs.ts_authkey }}" --hostname bullet
+          $ip = & $ts ip -4 | Select-Object -First 1
+          "TAILSCALE_IP=$ip" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $ip"
+
+      # ===============================
+      # ENABLE RDP
+      # ===============================
+      - name: Enable RDP User & Firewall
+        run: |
+          $u = $env:RDP_USER
+          $sec = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name $u -EA SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+          } else {
+            Set-LocalUser -Name $u -Password $sec
+            Enable-LocalUser -Name $u
+          }
+
+          Add-LocalGroupMember Administrators $u -EA SilentlyContinue
+          Add-LocalGroupMember "Remote Desktop Users" $u -EA SilentlyContinue
+
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name fDenyTSConnections -Value 0
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          Write-Host "RDP READY"
+          Write-Host "USER : $u"
+          Write-Host "PASS : $env:RDP_PASS"
+          Write-Host "IP   : $env:TAILSCALE_IP"
+
+      # ===============================
+      # KEEP ALIVE (SERVER LOCALHOST)
+      # ===============================
+      - name: Keep Alive (localhost server runtime)
+        run: |
+          $mins = [int]"${{ inputs.runtime_minutes }}"
+          if ($mins -gt 360) { $mins = 355 }
+          if ($mins -lt 5) { $mins = 355 }
+
+          $end = (Get-Date).AddMinutes($mins)
+          while ((Get-Date) -lt $end) {
+            Write-Host ("[RDP-ONLY] Alive " + (Get-Date).ToString("HH:mm:ss") + `
+              " | IP: $env:TAILSCALE_IP | ends: " + $end.ToString("HH:mm:ss"))
+            Start-Sleep 60
+          }
